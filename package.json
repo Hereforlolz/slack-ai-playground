@@ -1,0 +1,28 @@
+{
+  "name": "slack-ai-playground",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Hereforlolz/slack-ai-playground.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "bugs": {
+    "url": "https://github.com/Hereforlolz/slack-ai-playground/issues"
+  },
+  "homepage": "https://github.com/Hereforlolz/slack-ai-playground#readme",
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.100.1",
+    "@slack/bolt": "^4.7.3",
+    "axios": "^1.17.0",
+    "dotenv": "^17.4.2",
+    "groq-sdk": "^1.2.1"
+  }
+}
