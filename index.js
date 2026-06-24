@@ -1,5 +1,5 @@
 require('dotenv').config();
-const { App } = require('@slack/bolt');
+const { App, Assistant } = require('@slack/bolt');
 const Groq = require('groq-sdk');
 const axios = require('axios');
 
@@ -44,25 +44,24 @@ const roleButtons = [
 ];
 
 function buildRoleBlock(headerText) {
-  return {
-    text: headerText,
-    blocks: [
-      {
-        type: 'section',
-        text: { type: 'mrkdwn', text: headerText },
-      },
-      {
-        type: 'actions',
-        block_id: 'role_selection',
-        elements: roleButtons.map((r) => ({
-          type: 'button',
-          text: { type: 'plain_text', text: r.text },
-          value: r.value,
-          action_id: r.action_id,
-        })),
-      },
-    ],
-  };
+  const blocks = [];
+  if (headerText && headerText.trim()) {
+    blocks.push({
+      type: 'section',
+      text: { type: 'mrkdwn', text: headerText },
+    });
+  }
+  blocks.push({
+    type: 'actions',
+    block_id: 'role_selection',
+    elements: roleButtons.map((r) => ({
+      type: 'button',
+      text: { type: 'plain_text', text: r.text },
+      value: r.value,
+      action_id: r.action_id,
+    })),
+  });
+  return { text: headerText && headerText.trim() ? headerText : 'Pick your role:', blocks };
 }
 
 // ── Role → search expansion ───────────────────────────────
@@ -179,11 +178,9 @@ function formatSourcesBlock(sources) {
 // history) this can legitimately return empty arrays even when message
 // search works fine for the same query — this is expected RTS behavior,
 // not a bug. The downstream prompt is built to handle that gracefully.
-async function discoverPeopleAndChannels(roleLabel) {
+async function discoverPeopleAndChannels(role) {
   const results = await rtsSearch({
-    query: roleSearchTerms[Object.keys(roleSearchTerms).find(
-      (k) => roleLabel.toLowerCase().includes(k)
-    ) || 'other'],
+    query: roleSearchTerms[role] || roleSearchTerms.other,
     contentTypes: ['users', 'channels'],
     limit: 8,
   });
@@ -205,7 +202,132 @@ async function askGroq(prompt, maxTokens = 1024) {
   return response.choices[0].message.content;
 }
 
+// ── Assistant container (top bar / split pane) ────────────
+// Replaces the old /ask slash command and DM-posted role buttons.
+// Everything the user types or clicks inside the container now flows
+// through this one lifecycle instead of a slash command + action ids.
+// IMPORTANT: app.assistant(assistant) is called here, BEFORE any other
+// app.event/app.action/app.command registration below. Bolt's assistant()
+// method internally calls assistant.getMiddleware() to convert the
+// Assistant instance into a valid middleware function before pushing it —
+// app.use(assistant) does NOT do this conversion and causes
+// "middleware[toCallMiddlewareIndex] is not a function" on every event.
+const ROLE_LABELS = {
+  engineer: 'Engineer',
+  pm: 'Product Manager',
+  designer: 'Designer',
+  other: 'New Member',
+};
+
+// userMessage gets plain text — if it matches a role-pick prompt
+// ("I'm a new Engineer, brief me") we route to handleRoleSelection
+// instead of treating it as a follow-up /ask-style question. This
+// is what lets Suggested Prompts double as the role-selection entry
+// point alongside the explicit buttons.
+function detectRoleFromText(text) {
+  const t = text.toLowerCase();
+  if (/\bengineer/.test(t)) return 'engineer';
+  if (/\b(pm|product manager)/.test(t)) return 'pm';
+  if (/\bdesign/.test(t)) return 'designer';
+  return null;
+}
+
+const assistant = new Assistant({
+  threadStarted: async ({ say, setSuggestedPrompts, saveThreadContext }) => {
+    await say(
+      buildRoleBlock(
+        `👋 *Welcome!* I'm TeamTrail — I build onboarding briefings from real workspace activity, not a static doc.\n\n*What's your role?*`
+      )
+    );
+
+    await setSuggestedPrompts({
+      title: 'Get started:',
+      prompts: [
+        { title: "I'm a new Engineer", message: "I'm a new Engineer, brief me" },
+        { title: "I'm a new PM", message: "I'm a new Product Manager, brief me" },
+        { title: "I'm a new Designer", message: "I'm a new Designer, brief me" },
+        { title: 'What channels should I join?', message: 'What channels should I join?' },
+      ],
+    });
+
+    await saveThreadContext();
+  },
+
+  threadContextChanged: async ({ saveThreadContext }) => {
+    await saveThreadContext();
+  },
+
+  userMessage: async ({ message, say, setStatus }) => {
+    const userId = message.user;
+    const question = (message.text || '').trim();
+    const ctx = getContext(userId);
+
+    if (!question) return;
+
+    // Route 1: role pick typed via suggested prompt instead of button click
+    const detectedRole = detectRoleFromText(question);
+    if (detectedRole && !ctx.briefingSent) {
+      await handleRoleSelection(detectedRole, ROLE_LABELS[detectedRole], userId, say, setStatus);
+      return;
+    }
+
+    // Route 2: follow-up question — same pipeline /ask used to run
+    ctx.questionsAsked.push(question);
+    updateContext(userId, { questionsAsked: ctx.questionsAsked });
+
+    await setStatus('Searching the workspace...');
+
+    const semanticQuery = asSemanticQuery(question);
+    const results = await rtsSearch({
+      query: semanticQuery,
+      contentTypes: ['messages'],
+      limit: 10,
+      includeContext: true,
+    });
+
+    const { promptText, sources } = formatMessageResults(results?.messages);
+
+    const prompt = `You are an onboarding assistant for a new ${ctx.roleLabel || 'team member'} in a Slack workspace.
+
+Their context:
+- Role: ${ctx.roleLabel || 'Unknown'}
+- Topics already covered: ${ctx.topicsCovered.join(', ') || 'None yet'}
+- Previous questions: ${ctx.questionsAsked.slice(0, -1).join(', ') || 'None yet'}
+
+Their question: "${question}"
+
+Relevant workspace messages (numbered, with surrounding context where available):
+${promptText}
+
+Answer concisely. Reference message numbers like [1] when you draw on a specific result. Do NOT repeat topics already covered. Use Slack markdown. End with one follow-up suggestion.`;
+
+    await setStatus('Writing your answer...');
+
+    try {
+      const answer = await askGroq(prompt, 512);
+
+      ctx.topicsCovered.push(question.slice(0, 50));
+      updateContext(userId, { topicsCovered: ctx.topicsCovered });
+
+      const sourcesBlock = formatSourcesBlock(sources);
+      const blocks = [{ type: 'section', text: { type: 'mrkdwn', text: answer } }];
+      if (sourcesBlock) blocks.push(sourcesBlock);
+
+      await say({ text: answer, blocks });
+    } catch (err) {
+      console.error('userMessage error:', err.message);
+    }
+  },
+});
+
+app.assistant(assistant);
+
 // ── Step 1: New member joined ─────────────────────────────
+// With Agents & AI Apps enabled, the assistant container (top bar /
+// split pane) is the primary entry point. We still DM on join, but
+// now it's a nudge toward that container rather than buttons posted
+// straight into the DM — role selection itself happens inside
+// threadStarted below, once the user opens the container.
 app.event('member_joined_channel', async ({ event, client }) => {
   const userId = event.user;
   const ctx = getContext(userId);
@@ -214,9 +336,7 @@ app.event('member_joined_channel', async ({ event, client }) => {
   try {
     await client.chat.postMessage({
       channel: userId,
-      ...buildRoleBlock(
-        `👋 *Welcome to the workspace!*\n\nI'm your onboarding assistant. I'll learn what you need to know and make sure you're not told the same thing twice.\n\n*First — what's your role?*`
-      ),
+      text: `👋 *Welcome to the workspace!*\n\nI'm your onboarding assistant — open me from the *top bar* (or click here) to get a briefing built from real workspace activity, not a static doc.`,
     });
   } catch (err) {
     console.error('Welcome DM error:', err.message);
@@ -224,30 +344,19 @@ app.event('member_joined_channel', async ({ event, client }) => {
 });
 
 // ── Step 2: Role selected → generate briefing ─────────────
-async function handleRoleSelection(role, roleLabel, body, client) {
-  const userId = body.user.id;
+// `say` posts into the active assistant thread (works for both the
+// button-click path and a typed "I'm an Engineer" path via userMessage).
+async function handleRoleSelection(role, roleLabel, userId, say, setStatus) {
   updateContext(userId, { role, roleLabel });
 
-  await client.chat.update({
-    channel: body.channel.id,
-    ts: body.message.ts,
-    text: `Got it — you're a *${roleLabel}*! Pulling together your briefing... ⏳`,
-    blocks: [
-      {
-        type: 'section',
-        text: {
-          type: 'mrkdwn',
-          text: `Got it — you're a *${roleLabel}*! Pulling together your briefing... ⏳`,
-        },
-      },
-    ],
-  });
+  await say(`Got it — you're a *${roleLabel}*! Pulling together your briefing... ⏳`);
+  if (setStatus) await setStatus('Searching the workspace...');
 
   const searchTerms = roleSearchTerms[role] || roleSearchTerms.other;
 
   const [messageResults, discovery] = await Promise.all([
     rtsSearch({ query: searchTerms, contentTypes: ['messages'], limit: 10, includeContext: true }),
-    discoverPeopleAndChannels(roleLabel),
+    discoverPeopleAndChannels(role),
   ]);
 
   const { promptText, sources } = formatMessageResults(messageResults?.messages);
@@ -281,6 +390,8 @@ Write a briefing that includes:
 
 Keep it warm, concise, and actionable. Use Slack markdown (bold with *asterisks*, bullets with •). If no real people/channels were found, say so honestly instead of making something up.`;
 
+  if (setStatus) await setStatus('Writing your briefing...');
+
   try {
     const briefing = await askGroq(prompt);
 
@@ -303,7 +414,7 @@ Keep it warm, concise, and actionable. Use Slack markdown (bold with *asterisks*
         type: 'section',
         text: {
           type: 'mrkdwn',
-          text: `💬 Use \`/ask\` anytime to search the workspace. Example: \`/ask what's the engineering team working on?\``,
+          text: `💬 Just type a follow-up question anytime — I keep context across the session.`,
         },
       },
       {
@@ -320,92 +431,27 @@ Keep it warm, concise, and actionable. Use Slack markdown (bold with *asterisks*
       }
     );
 
-    await client.chat.postMessage({
-      channel: userId,
-      text: briefing,
-      blocks,
-    });
+    await say({ text: briefing, blocks });
   } catch (err) {
     console.error('Briefing error:', err.message);
   }
 }
 
-// ── Step 3: /ask slash command ────────────────────────────
-app.command('/ask', async ({ command, ack, client }) => {
-  await ack();
-
-  const userId = command.user_id;
-  const question = command.text?.trim();
-  const ctx = getContext(userId);
-
-  if (!question) {
-    await client.chat.postMessage({
-      channel: userId,
-      text: `Please include a question. Example: \`/ask what is the engineering team working on?\``,
-    });
-    return;
-  }
-
-  ctx.questionsAsked.push(question);
-  updateContext(userId, { questionsAsked: ctx.questionsAsked });
-
-  const semanticQuery = asSemanticQuery(question);
-
-  await client.chat.postMessage({
-    channel: userId,
-    text: `🔍 Searching the workspace for: "${question}"...`,
-  });
-
-  const results = await rtsSearch({
-    query: semanticQuery,
-    contentTypes: ['messages'],
-    limit: 10,
-    includeContext: true,
-  });
-
-  const { promptText, sources } = formatMessageResults(results?.messages);
-
-  const prompt = `You are an onboarding assistant for a new ${ctx.roleLabel || 'team member'} in a Slack workspace.
-
-Their context:
-- Role: ${ctx.roleLabel || 'Unknown'}
-- Topics already covered: ${ctx.topicsCovered.join(', ') || 'None yet'}
-- Previous questions: ${ctx.questionsAsked.slice(0, -1).join(', ') || 'None yet'}
-
-Their question: "${question}"
-
-Relevant workspace messages (numbered, with surrounding context where available):
-${promptText}
-
-Answer concisely. Reference message numbers like [1] when you draw on a specific result. Do NOT repeat topics already covered. Use Slack markdown. End with one follow-up suggestion.`;
-
-  try {
-    const answer = await askGroq(prompt, 512);
-
-    ctx.topicsCovered.push(question.slice(0, 50));
-    updateContext(userId, { topicsCovered: ctx.topicsCovered });
-
-    const sourcesBlock = formatSourcesBlock(sources);
-    const blocks = [{ type: 'section', text: { type: 'mrkdwn', text: answer } }];
-    if (sourcesBlock) blocks.push(sourcesBlock);
-
-    await client.chat.postMessage({
-      channel: userId,
-      text: answer,
-      blocks,
-    });
-  } catch (err) {
-    console.error('/ask error:', err.message);
-  }
-});
-
 // ── Refresh briefing button ───────────────────────────────
+// NOTE: say() inside app.action() does not reliably post into the
+// active assistant thread — observed posting into App Home History
+// instead of the live Chat pane. Posting explicitly via
+// client.chat.postMessage with the action's own channel + thread_ts
+// keeps the reply anchored to the thread the button was clicked in.
 app.action('refresh_briefing', async ({ ack, body, client }) => {
   await ack();
   updateContext(body.user.id, { briefingSent: false, topicsCovered: [] });
+
+  const block = buildRoleBlock(`🔄 *Let's refresh your briefing!*\n\nWhat's your role?`);
   await client.chat.postMessage({
-    channel: body.user.id,
-    ...buildRoleBlock(`🔄 *Let's refresh your briefing!*\n\nWhat's your role?`),
+    channel: body.channel?.id || body.user.id,
+    thread_ts: body.container?.thread_ts,
+    ...block,
   });
 });
 
@@ -420,7 +466,15 @@ const roleMap = {
 Object.entries(roleMap).forEach(([actionId, [role, roleLabel]]) => {
   app.action(actionId, async ({ body, client, ack }) => {
     await ack();
-    await handleRoleSelection(role, roleLabel, body, client);
+    const sayToThread = async (payload) => {
+      const msg = typeof payload === 'string' ? { text: payload } : payload;
+      return client.chat.postMessage({
+        channel: body.channel?.id || body.user.id,
+        thread_ts: body.container?.thread_ts,
+        ...msg,
+      });
+    };
+    await handleRoleSelection(role, roleLabel, body.user.id, sayToThread, null);
   });
 });
 
