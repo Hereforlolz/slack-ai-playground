@@ -1,4 +1,4 @@
-# Slack Role Onboard Agent
+# TeamTrail 
 
 An AI-powered, stateful onboarding agent for Slack. When a new member joins a workspace, the agent greets them, asks their role, searches real workspace history via Slack's Real-time Search API, and generates a personalised briefing using LLaMA 3.3 70B via Groq — grounded in actual messages, real people, and real channels. A `/ask` command lets them keep querying the workspace anytime, with full context awareness across the session.
 

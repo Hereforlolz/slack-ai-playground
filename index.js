@@ -427,5 +427,5 @@ Object.entries(roleMap).forEach(([actionId, [role, roleLabel]]) => {
 // ── Start ─────────────────────────────────────────────────
 (async () => {
   await app.start();
-  console.log('⚡ Stateful Role Onboard Agent is running!');
+  console.log('⚡ TeamTrail is running!');
 })();
