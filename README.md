@@ -57,6 +57,80 @@ Briefing posted with cited source permalinks + Refresh button
 
 ---
 
+## Architecture
+
+```mermaid
+---
+config:
+  theme: neo
+---
+flowchart TD
+    subgraph Slack["Slack Workspace"]
+        MJ[Member joins channel]
+        BTN[Role selection buttons\nEngineer / PM / Designer / Other]
+        DM[DM to new member]
+        ASK[Ask slash command]
+        REFRESH[Refresh briefing button]
+        OUT1[Briefing message\nwith permalink citations]
+        OUT2[Ask response\nwith permalink citations]
+    end
+
+    subgraph Bot["index.js — Slack Bolt App (Socket Mode)"]
+        EV[member_joined_channel\nevent handler]
+        ACT[Role action handler\nrole_engineer / role_pm\nrole_designer / role_other]
+        CMD[Ask command handler]
+        SQ[asSemanticQuery\nquery rewriter]
+        FMT[formatMessageResults\nbuild prompt text + sources]
+        FMTS[formatSourcesBlock\nbuild permalink blocks]
+        CTX[(In-memory\ncontext store\nrole · topicsCovered\nquestionsAsked · briefingSent)]
+    end
+
+    subgraph RTS["Slack RTS API\nassistant.search.context\nxoxp- user token"]
+        RTS1[Message search\ncontent_types: messages\ninclude_context_messages: true]
+        RTS2[User + channel discovery\ncontent_types: users, channels]
+        RTS3[Ask semantic search\ncontent_types: messages\ninclude_context_messages: true]
+    end
+
+    subgraph Groq["Groq API\nLLaMA 3.3 70B Versatile"]
+        G1[Briefing prompt\nrole + messages + real people\n+ real channels]
+        G2[Ask prompt\nquestion + messages\n+ session context]
+    end
+
+    subgraph RoleExpansion["Role → Search Term Expansion"]
+        RE[engineer → engineering OR backend\nOR infrastructure OR deployment\npm → roadmap OR product OR launch\ndesigner → design OR UX OR figma\nother → onboarding OR team OR goals]
+    end
+
+    MJ -->|triggers| EV
+    EV -->|postMessage| DM
+    DM --> BTN
+    BTN -->|action event| ACT
+    ACT --> RE
+    RE -->|expanded OR query| RTS1
+    RE -->|expanded OR query| RTS2
+    RTS1 -->|messages + context threads| FMT
+    RTS2 -->|real users + channels| G1
+    FMT -->|promptText| G1
+    FMT -->|sources array| FMTS
+    G1 -->|briefing text| OUT1
+    FMTS -->|permalink blocks| OUT1
+    ACT -->|update context| CTX
+
+    ASK -->|raw query| CMD
+    CMD --> SQ
+    SQ -->|semantic question| RTS3
+    RTS3 -->|messages + context threads| FMT
+    FMT -->|promptText| G2
+    CTX -->|role · topicsCovered\nquestionsAsked| G2
+    G2 -->|answer with N citations| OUT2
+    FMTS -->|permalink blocks| OUT2
+    CMD -->|append question| CTX
+
+    REFRESH -->|reset briefingSent\nclear topicsCovered| CTX
+    CTX -->|rebuilt context| ACT
+
+```
+---
+
 ## RTS API — what's actually happening
 
 The bot makes three distinct uses of `assistant.search.context`:
