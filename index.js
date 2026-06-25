@@ -2,6 +2,7 @@ require('dotenv').config();
 const { App, Assistant } = require('@slack/bolt');
 const Groq = require('groq-sdk');
 const axios = require('axios');
+const { notionSearch } = require('./notion');
 
 // ── Clients ──────────────────────────────────────────────
 const app = new App({
@@ -73,6 +74,16 @@ const roleSearchTerms = {
   pm: 'roadmap OR product OR launch OR prioritization OR planning',
   designer: 'design OR UX OR figma OR prototype OR user research',
   other: 'onboarding OR team OR projects OR goals',
+};
+
+// Notion's search tool takes a plain-text query, not RTS's OR-operator
+// syntax — a separate, simpler term per role rather than reusing
+// roleSearchTerms with the operators stripped out at runtime.
+const notionSearchTerms = {
+  engineer: 'engineering architecture deployment',
+  pm: 'roadmap product launch',
+  designer: 'design UX prototype',
+  other: 'onboarding team',
 };
 
 // Turn a raw query into a natural-language question when it isn't
@@ -201,9 +212,26 @@ function formatCombinedResults(messages = [], files = []) {
 
 function formatSourcesBlock(sources) {
   if (!sources.length) return null;
-  const lines = sources
-    .slice(0, 5)
-    .map((s, i) => `${i + 1}. <${s.permalink}|#${s.channel}>`)
+
+  // Naive slice(0, 5) on the merged array let Slack message sources
+  // (often already 5+) crowd out Notion sources appended at the end —
+  // Notion content would show up in the briefing text but never in the
+  // Sources block. Reserve room for at least one Notion source if any
+  // exist, instead of truncating purely by array order.
+  const notionSources = sources.filter((s) => s.channel === 'notion');
+  const otherSources = sources.filter((s) => s.channel !== 'notion');
+
+  const notionSlots = notionSources.length ? Math.min(2, notionSources.length) : 0;
+  const otherSlots = 5 - notionSlots;
+
+  const selected = [...otherSources.slice(0, otherSlots), ...notionSources.slice(0, notionSlots)];
+
+  const lines = selected
+    .map((s, i) => {
+      const label = s.channel === 'notion' ? '📘 Notion' : s.channel === 'file' ? '📄 file' : `#${s.channel}`;
+      if (!s.permalink) return `${i + 1}. ${label}`;
+      return `${i + 1}. <${s.permalink}|${label}>`;
+    })
     .join('\n');
   return {
     type: 'context',
@@ -317,14 +345,21 @@ const assistant = new Assistant({
     await setStatus('Searching the workspace...');
 
     const semanticQuery = asSemanticQuery(question);
-    const results = await rtsSearch({
-      query: semanticQuery,
-      contentTypes: ['messages'],
-      limit: 10,
-      includeContext: true,
-    });
+    const [results, notionResult] = await Promise.all([
+      rtsSearch({
+        query: semanticQuery,
+        contentTypes: ['messages', 'files'],
+        limit: 10,
+        includeContext: true,
+      }),
+      notionSearch(question),
+    ]);
 
-    const { promptText, sources } = formatMessageResults(results?.messages);
+    const slackCombined = formatCombinedResults(results?.messages, results?.files);
+    const promptText = [slackCombined.promptText, notionResult.promptText]
+      .filter(Boolean)
+      .join('\n---\n');
+    const sources = [...slackCombined.sources, ...notionResult.sources];
 
     const prompt = `You are an onboarding assistant for a new ${ctx.roleLabel || 'team member'} in a Slack workspace.
 
@@ -335,10 +370,10 @@ Their context:
 
 Their question: "${question}"
 
-Relevant workspace messages (numbered, with surrounding context where available):
+Relevant workspace messages, files, and Notion content (numbered, with surrounding context where available):
 ${promptText}
 
-Answer concisely. Reference message numbers like [1] when you draw on a specific result. Do NOT repeat topics already covered. Use Slack markdown. End with one follow-up suggestion.`;
+Answer concisely. Reference result numbers like [1] or [N1] when you draw on a specific result. Do NOT repeat topics already covered. Use Slack markdown. End with one follow-up suggestion.`;
 
     await setStatus('Writing your answer...');
 
@@ -388,17 +423,24 @@ app.event('member_joined_channel', async ({ event, client }) => {
 async function handleRoleSelection(role, roleLabel, userId, say, setStatus) {
   updateContext(userId, { role, roleLabel });
 
-  await say(`Got it — you're a *${roleLabel}*! Pulling together your briefing... ⏳`);
+  const article = /^[aeiou]/i.test(roleLabel) ? 'an' : 'a';
+  await say(`Got it — you're ${article} *${roleLabel}*! Pulling together your briefing... ⏳`);
   if (setStatus) await setStatus('Searching the workspace...');
 
   const searchTerms = roleSearchTerms[role] || roleSearchTerms.other;
+  const notionTerms = notionSearchTerms[role] || notionSearchTerms.other;
 
-  const [messageResults, discovery] = await Promise.all([
-    rtsSearch({ query: searchTerms, contentTypes: ['messages'], limit: 10, includeContext: true }),
+  const [messageResults, discovery, notionResult] = await Promise.all([
+    rtsSearch({ query: searchTerms, contentTypes: ['messages', 'files'], limit: 10, includeContext: true }),
     discoverPeopleAndChannels(role),
+    notionSearch(notionTerms),
   ]);
 
-  const { promptText, sources } = formatMessageResults(messageResults?.messages);
+  const slackCombined = formatCombinedResults(messageResults?.messages, messageResults?.files);
+  const promptText = [slackCombined.promptText, notionResult.promptText]
+    .filter(Boolean)
+    .join('\n---\n');
+  const sources = [...slackCombined.sources, ...notionResult.sources];
 
   const peopleList = discovery.users
     .slice(0, 5)
@@ -412,7 +454,7 @@ async function handleRoleSelection(role, roleLabel, userId, say, setStatus) {
 
   const prompt = `You are an intelligent onboarding assistant for a new ${roleLabel} joining a Slack workspace.
 
-Based on the following recent Slack messages (with surrounding context where available), create a personalised onboarding briefing.
+Based on the following recent Slack messages and files, plus any relevant Notion pages (marked with [N1], [N2], etc., with surrounding context where available), create a personalised onboarding briefing.
 
 Recent workspace activity:
 ${promptText}
@@ -422,12 +464,12 @@ Real channels relevant to this role, found via workspace search: ${channelList}
 
 Write a briefing that includes:
 1. A 2-3 sentence summary of what's currently happening relevant to a ${roleLabel}
-2. 2-3 specific topics or projects they should know about, grounded in the messages above
+2. 2-3 specific topics or projects they should know about, grounded in the messages/files/Notion content above
 3. Name-check 2-3 of the real people listed above and why they're worth introducing yourself to (use the actual names given, do not invent people)
 4. Recommend 2-3 of the real channels listed above (use the actual channel names given, do not invent channels)
 5. One piece of advice for their first week
 
-Keep it warm, concise, and actionable. Use Slack markdown (bold with *asterisks*, bullets with •). If no real people/channels were found, say so honestly instead of making something up.`;
+Keep it warm, concise, and actionable. Use Slack markdown (bold with *asterisks*, bullets with •). If no real people/channels were found, say so honestly instead of making something up. If no Notion content was found, don't mention Notion at all — just use what's available.`;
 
   if (setStatus) await setStatus('Writing your briefing...');
 
